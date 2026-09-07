@@ -1,17 +1,94 @@
+# ==============================================================================
+#  Karlscraft - Ressourcenpaket veroeffentlichen
+#
+#  Ablage:  .github/workflows/paket.yml   (im Repo Karlscraft/Ressourcenpaket)
+#
+#  Baut bei jedem Push auf main ein korrekt strukturiertes ZIP und haengt es
+#  an ein neues Release. Die feste Downloadadresse lautet danach:
+#
+#    https://github.com/Karlscraft/Ressourcenpaket/releases/latest/download/Karlscraft.zip
+#
+#  Warum ueberhaupt ein Release-Asset und nicht das GitHub-Quellarchiv:
+#    1. Das Quellarchiv verpackt alles in einen Unterordner. Minecraft erwartet
+#       pack.mcmeta in der Archivwurzel und lehnt das Paket sonst ab.
+#    2. GitHub garantiert fuer automatisch erzeugte Archive keine stabilen
+#       Pruefsummen. Nur selbst hochgeladene Release-Assets bleiben unveraendert.
+# ==============================================================================
+
 name: Ressourcenpaket veroeffentlichen
+
 on:
   push:
     branches: [main]
+  workflow_dispatch:        # erlaubt zusaetzlich den Start per Knopfdruck
+
+# Erlaubt dem Workflow, ein Release anzulegen. Ohne diese Zeile scheitert
+# der letzte Schritt mit einem 403.
 permissions:
   contents: write
+
+# Verhindert, dass zwei Laeufe gleichzeitig Releases anlegen
+concurrency:
+  group: ressourcenpaket
+  cancel-in-progress: true
+
 jobs:
-  bauen:
+  veroeffentlichen:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - name: ZIP ohne umschliessenden Ordner erzeugen
-        run: zip -r /tmp/Karlscraft.zip . -x '.git/*' '.github/*' '*.md'
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: aktuell
-          files: /tmp/Karlscraft.zip
+      - name: Repository auschecken
+        uses: actions/checkout@v4
+
+      - name: Struktur pruefen
+        run: |
+          if [ ! -f pack.mcmeta ]; then
+            echo "::error::pack.mcmeta fehlt in der Wurzel des Repositories."
+            echo "Die Datei muss direkt im Hauptverzeichnis liegen, nicht in einem Unterordner."
+            exit 1
+          fi
+          if [ ! -d assets ]; then
+            echo "::error::Der Ordner assets/ fehlt in der Wurzel des Repositories."
+            exit 1
+          fi
+          echo "Struktur in Ordnung."
+          cat pack.mcmeta
+
+      - name: ZIP erzeugen
+        run: |
+          # Der Punkt packt den INHALT des Verzeichnisses ein, ohne
+          # umschliessenden Ordner - genau das braucht Minecraft.
+          zip -r -9 /tmp/Karlscraft.zip . \
+            -x '.git/*' '.github/*' '*.md' 'LICENSE' '.gitattributes' '.gitignore'
+          echo "--- Inhalt der Archivwurzel ---"
+          unzip -l /tmp/Karlscraft.zip | head -20
+
+      - name: Groesse und Pruefsumme ausgeben
+        run: |
+          GROESSE=$(stat -c%s /tmp/Karlscraft.zip)
+          SHA1=$(sha1sum /tmp/Karlscraft.zip | cut -d' ' -f1)
+          MB=$(( GROESSE / 1048576 ))
+
+          {
+            echo "### Ressourcenpaket gebaut"
+            echo ""
+            echo "| Feld | Wert |"
+            echo "| --- | --- |"
+            echo "| Groesse | ${MB} MB (${GROESSE} Byte) |"
+            echo "| SHA-1 | \`${SHA1}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$GROESSE" -gt 52428800 ]; then
+            echo "::warning::Ueber 50 MB - aeltere Minecraft-Clients lehnen zu grosse Pakete ab."
+          fi
+
+      - name: Release veroeffentlichen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # gh ist auf den Runnern vorinstalliert. Damit braucht dieser
+          # Workflow keine fremde Action, die Schreibrechte auf das Repo bekommt.
+          gh release create "v${{ github.run_number }}" /tmp/Karlscraft.zip \
+            --title "Ressourcenpaket v${{ github.run_number }}" \
+            --notes "Automatisch erzeugt aus Commit ${{ github.sha }}" \
+            --latest
