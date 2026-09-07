@@ -3,16 +3,17 @@
 #
 #  Ablage:  .github/workflows/paket.yml   (im Repo Karlscraft/Ressourcenpaket)
 #
-#  Baut bei jedem Push auf main ein korrekt strukturiertes ZIP und haengt es
-#  an ein neues Release. Die feste Downloadadresse lautet danach:
+#  Versionsschema nach Mojangs Snapshot-Vorbild:  26w37a
+#    26  = ISO-Wochenjahr, zweistellig
+#    w   = week
+#    37  = ISO-Kalenderwoche
+#    a   = fortlaufender Buchstabe, falls mehrere Veroeffentlichungen pro Woche
 #
-#    https://github.com/Karlscraft/Ressourcenpaket/releases/latest/download/Karlscraft.zip
-#
-#  Warum ueberhaupt ein Release-Asset und nicht das GitHub-Quellarchiv:
-#    1. Das Quellarchiv verpackt alles in einen Unterordner. Minecraft erwartet
-#       pack.mcmeta in der Archivwurzel und lehnt das Paket sonst ab.
-#    2. GitHub garantiert fuer automatisch erzeugte Archive keine stabilen
-#       Pruefsummen. Nur selbst hochgeladene Release-Assets bleiben unveraendert.
+#  Es werden ZWEI identische Dateien an das Release gehaengt:
+#    26w37a.zip      - die versionierte Fassung zum Archivieren und Verlinken
+#    Karlscraft.zip  - gleicher Inhalt unter festem Namen, damit die Adresse
+#                      .../releases/latest/download/Karlscraft.zip stabil bleibt.
+#                      Das Startskript des Servers holt sich diese Datei.
 # ==============================================================================
 
 name: Ressourcenpaket veroeffentlichen
@@ -20,17 +21,15 @@ name: Ressourcenpaket veroeffentlichen
 on:
   push:
     branches: [main]
-  workflow_dispatch:        # erlaubt zusaetzlich den Start per Knopfdruck
+  workflow_dispatch:
 
-# Erlaubt dem Workflow, ein Release anzulegen. Ohne diese Zeile scheitert
-# der letzte Schritt mit einem 403.
 permissions:
   contents: write
 
-# Verhindert, dass zwei Laeufe gleichzeitig Releases anlegen
+# Zwei gleichzeitige Laeufe wuerden denselben Buchstaben vergeben
 concurrency:
   group: ressourcenpaket
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   veroeffentlichen:
@@ -39,6 +38,8 @@ jobs:
     steps:
       - name: Repository auschecken
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # bringt die vorhandenen Tags mit
 
       - name: Struktur pruefen
         run: |
@@ -52,28 +53,108 @@ jobs:
             exit 1
           fi
           echo "Struktur in Ordnung."
-          cat pack.mcmeta
+
+      - name: Version bestimmen
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # %G und %V gehoeren zwingend zusammen: %G ist das ISO-WOCHENjahr,
+          # nicht das Kalenderjahr. Der 30.12.2025 liegt in ISO-Woche 1 von
+          # 2026 und heisst damit korrekt 26w01x. Mit %Y statt %G kaeme hier
+          # faelschlich 25w01x heraus.
+          ISO_JAHR=$(date -u +%G)
+          WOCHE=$(date -u +%V)
+          BASIS="${ISO_JAHR: -2}w${WOCHE}"
+          echo "Basis dieser Woche: $BASIS  (UTC: $(date -u))"
+
+          # Bereits vergebene Kennungen sammeln - sowohl aus Releases als auch
+          # aus Tags. Ein geloeschtes Release kann seinen Tag hinterlassen, und
+          # der wuerde beim Anlegen kollidieren.
+          VERGEBEN=$( {
+            gh release list --limit 1000 --json tagName --jq '.[].tagName' 2>/dev/null || true
+            git tag -l "${BASIS}*" || true
+          } | sort -u )
+
+          BUCHSTABEN=({a..z})
+
+          # 0->a, 25->z, 26->aa, 27->ab ... reicht fuer 702 Stueck pro Woche
+          suffix_fuer() {
+            local n=$1
+            if [ "$n" -lt 26 ]; then
+              echo "${BUCHSTABEN[$n]}"
+            else
+              echo "${BUCHSTABEN[$(( n / 26 - 1 ))]}${BUCHSTABEN[$(( n % 26 ))]}"
+            fi
+          }
+
+          VERSION=""
+          for i in $(seq 0 701); do
+            KANDIDAT="${BASIS}$(suffix_fuer "$i")"
+            if ! printf '%s\n' "$VERGEBEN" | grep -qx "$KANDIDAT"; then
+              VERSION="$KANDIDAT"
+              break
+            fi
+          done
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::Alle Kennungen fuer $BASIS sind vergeben."
+            exit 1
+          fi
+
+          echo "Neue Version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Version in pack.mcmeta eintragen
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+
+          # Nur wenn die Beschreibung ein einfacher Text ist - bei einer
+          # JSON-Textkomponente wuerde das Anhaengen fehlschlagen.
+          if jq -e '.pack.description | type == "string"' pack.mcmeta > /dev/null; then
+            jq --arg v "$VERSION" '.pack.description = (.pack.description + " " + $v)' \
+               pack.mcmeta > /tmp/pack.mcmeta
+            mv /tmp/pack.mcmeta pack.mcmeta
+            echo "Beschreibung im Paket:"
+            jq -r '.pack.description' pack.mcmeta
+          else
+            echo "Beschreibung ist kein einfacher Text - bleibt unveraendert."
+          fi
 
       - name: ZIP erzeugen
         run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+
           # Der Punkt packt den INHALT des Verzeichnisses ein, ohne
           # umschliessenden Ordner - genau das braucht Minecraft.
-          zip -r -9 /tmp/Karlscraft.zip . \
+          zip -r -9 "/tmp/${VERSION}.zip" . \
             -x '.git/*' '.github/*' '*.md' 'LICENSE' '.gitattributes' '.gitignore'
-          echo "--- Inhalt der Archivwurzel ---"
-          unzip -l /tmp/Karlscraft.zip | head -20
+
+          # Zweite, namensstabile Ausfertigung fuer das Startskript
+          cp "/tmp/${VERSION}.zip" /tmp/Karlscraft.zip
+
+          echo "--- Wurzel des Archivs ---"
+          unzip -l "/tmp/${VERSION}.zip" | head -20
 
       - name: Groesse und Pruefsumme ausgeben
         run: |
-          GROESSE=$(stat -c%s /tmp/Karlscraft.zip)
-          SHA1=$(sha1sum /tmp/Karlscraft.zip | cut -d' ' -f1)
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+
+          GROESSE=$(stat -c%s "/tmp/${VERSION}.zip")
+          SHA1=$(sha1sum "/tmp/${VERSION}.zip" | cut -d' ' -f1)
           MB=$(( GROESSE / 1048576 ))
 
           {
-            echo "### Ressourcenpaket gebaut"
+            echo "### Ressourcenpaket ${VERSION}"
             echo ""
             echo "| Feld | Wert |"
             echo "| --- | --- |"
+            echo "| Version | \`${VERSION}\` |"
             echo "| Groesse | ${MB} MB (${GROESSE} Byte) |"
             echo "| SHA-1 | \`${SHA1}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -86,9 +167,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+
           # gh ist auf den Runnern vorinstalliert. Damit braucht dieser
           # Workflow keine fremde Action, die Schreibrechte auf das Repo bekommt.
-          gh release create "v${{ github.run_number }}" /tmp/Karlscraft.zip \
-            --title "Ressourcenpaket v${{ github.run_number }}" \
+          gh release create "$VERSION" \
+            "/tmp/${VERSION}.zip" \
+            /tmp/Karlscraft.zip \
+            --title "$VERSION" \
             --notes "Automatisch erzeugt aus Commit ${{ github.sha }}" \
             --latest
